@@ -162,3 +162,22 @@ describe("useTransactionGuard", () => {
         expect(result.current.isGuardActive).toBe(false);
     });
 });
+
+
+describe("campaign sponsor retry behavior (#732)", () => {
+    it("releases the submit lock after a failed wallet submission and permits retry", async () => {
+        const { result } = renderHook(() => useTransactionGuard(2000));
+        const failedSubmission = vi.fn().mockRejectedValue(new Error("User rejected"));
+        const retrySubmission = vi.fn().mockResolvedValue("retry-ok");
+
+        await act(async () => {
+            await expect(result.current.runWithGuard(failedSubmission)).rejects.toThrow("User rejected");
+        });
+        expect(result.current.isGuardActive).toBe(false);
+
+        await act(async () => {
+            await result.current.runWithGuard(retrySubmission);
+        });
+        expect(retrySubmission).toHaveBeenCalledTimes(1);
+    });
+});

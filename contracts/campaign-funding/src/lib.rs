@@ -35,6 +35,8 @@ pub enum DataKey {
     /// Bitmask of campaign goal milestones (25 %, 50 %, 75 %, 100 %) that
     /// have been reached so far, keyed by campaign ID (persistent storage).
     MilestonesReached(u64),
+    /// Ten-percent tree-replacement reserve held after a successful claim.
+    ReplacementReserve(u64),
 }
 
 /// Current lifecycle state of a campaign.
@@ -138,7 +140,7 @@ pub struct CampaignStatusChangedEvent {
 pub struct FundsClaimedEvent {
     pub campaign_id: u64,
     pub creator: Address,
-    /// Net amount after protocol fee deduction.
+    /// Net amount after protocol fee and replacement-reserve deductions.
     pub amount: i128,
 }
 
@@ -167,6 +169,15 @@ pub struct MilestoneReachedEvent {
     pub total_raised: i128,
     /// The campaign goal this milestone is measured against.
     pub target_amount: i128,
+}
+
+/// Emitted when successful campaign proceeds include a tree-replacement reserve.
+#[contractevent(topics = ["ReplacementReserveHeld"])]
+#[derive(Clone)]
+pub struct ReplacementReserveHeldEvent {
+    pub campaign_id: u64,
+    pub token: Address,
+    pub amount: i128,
 }
 
 /// Emitted when the protocol fee is collected during
@@ -256,6 +267,8 @@ const LEDGER_THRESHOLD: u32 = 518_400;
 const LEDGER_BUMP: u32 = 535_680;
 /// Maximum duration for a campaign (180 days in seconds).
 const MAX_CAMPAIGN_DURATION_SECONDS: u64 = 180 * 24 * 60 * 60;
+/// Portion of successful campaign proceeds held for dead-tree replacement.
+const REPLACEMENT_RESERVE_BPS: i128 = 1_000;
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -707,7 +720,17 @@ impl CampaignFundingContract {
 
         let gross = campaign.total_raised;
         let fee = Self::calculate_fee(&env, gross);
-        let net = gross - fee;
+        let reserve = gross
+            .checked_mul(REPLACEMENT_RESERVE_BPS)
+            .and_then(|value| value.checked_div(10_000))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ArithmeticOverflow));
+        let net = gross
+            .checked_sub(fee)
+            .and_then(|value| value.checked_sub(reserve))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::ArithmeticOverflow));
+        env.storage()
+            .persistent()
+            .set(&DataKey::ReplacementReserve(campaign_id), &reserve);
 
         campaign.status = CampaignStatus::Claimed;
         Self::save_campaign(&env, campaign_id, &campaign);
@@ -732,6 +755,12 @@ impl CampaignFundingContract {
         }
 
         Self::distribute_proceeds(&env, &campaign, campaign_id, net);
+        ReplacementReserveHeldEvent {
+            campaign_id,
+            token: campaign.token.clone(),
+            amount: reserve,
+        }
+        .publish(&env);
 
         env.events().publish(
             ("FundsClaimed", campaign_id),
@@ -886,6 +915,13 @@ impl CampaignFundingContract {
         env.storage()
             .persistent()
             .get(&DataKey::Contribution(campaign_id, contributor))
+            .unwrap_or(0)
+    }
+    /// Return the amount held for tree replacement after a successful claim.
+    pub fn get_replacement_reserve(env: Env, campaign_id: u64) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ReplacementReserve(campaign_id))
             .unwrap_or(0)
     }
 
@@ -1687,9 +1723,10 @@ mod tests {
 
         client.claim_funds(&id);
 
-        // 2.5 % fee on 8_000 = 200; net = 7_800.
-        assert_eq!(token_client.balance(&creator), 7_800);
+        // 2.5 % fee on 8_000 = 200; 10 % reserve = 800; net = 7_000.
+        assert_eq!(token_client.balance(&creator), 7_000);
         assert_eq!(token_client.balance(&fee_collector), 200);
+        assert_eq!(client.get_replacement_reserve(&id), 800);
         assert_eq!(client.get_campaign(&id).status, CampaignStatus::Claimed);
     }
 
@@ -1717,7 +1754,8 @@ mod tests {
         client.trigger_expiry(&id);
         client.claim_funds(&id);
 
-        assert_eq!(token_client.balance(&creator), 6_000);
+        assert_eq!(token_client.balance(&creator), 5_400);
+        assert_eq!(client.get_replacement_reserve(&id), 600);
         assert_eq!(token_client.balance(&fee_collector), 0);
     }
 
@@ -1995,8 +2033,9 @@ mod tests {
         client.trigger_expiry(&id);
         client.claim_funds(&id);
 
-        // fee = 9_999 * 100 / 10_000 = 99 (integer division); net = 9_900.
-        assert_eq!(token_client.balance(&creator), 9_900);
+        // fee = 9_999 * 100 / 10_000 = 99; reserve = 999; net = 8_901.
+        assert_eq!(token_client.balance(&creator), 8_901);
+        assert_eq!(client.get_replacement_reserve(&id), 999);
         assert_eq!(token_client.balance(&fee_collector), 99);
     }
 

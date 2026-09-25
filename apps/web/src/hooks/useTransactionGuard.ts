@@ -12,6 +12,7 @@ interface UseTransactionGuardReturn {
     isCoolingDown: boolean;
     isGuardActive: boolean;
     runWithGuard: <T>(fn: () => Promise<T>, options?: GuardOptions) => Promise<T | undefined>;
+    reset: () => void;
 }
 
 /**
@@ -72,6 +73,9 @@ export function useTransactionGuard(
                 cooldownRef.current = null;
             }
             setIsCoolingDown(false);
+            lockRef.current = false;
+            setIsSubmitting(false);
+            cooldownOverrideRef.current = undefined;
             return;
         }
 
@@ -86,6 +90,17 @@ export function useTransactionGuard(
             }
         }
     }, [mutationStatus, isMutationTracked, defaultCooldownMs]);
+
+    const reset = useCallback(() => {
+        if (cooldownRef.current) {
+            clearTimeout(cooldownRef.current);
+            cooldownRef.current = null;
+        }
+        lockRef.current = false;
+        setIsSubmitting(false);
+        setIsCoolingDown(false);
+        cooldownOverrideRef.current = undefined;
+    }, []);
 
     const runWithGuard = useCallback(
         async <T,>(fn: () => Promise<T>, options?: GuardOptions): Promise<T | undefined> => {
@@ -126,5 +141,6 @@ export function useTransactionGuard(
         isCoolingDown,
         isGuardActive,
         runWithGuard,
+        reset,
     };
 }
